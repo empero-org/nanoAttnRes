@@ -1,7 +1,4 @@
-# nanoAttnRes
-
-![nanoAttnRes logo](dev/nanochat.png)
-![scaling laws](dev/scaling_laws_jan26.png)
+# nanoAttnRes 
 
 **nanoAttnRes** is a fork of [nanochat](https://github.com/karpathy/nanochat) with **Block Attention Residuals (AttnRes)** enabled by default. It is the simplest experimental harness for training LLMs with AttnRes, keeping everything minimal, hackable, and working as intended.
 
