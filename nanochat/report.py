@@ -126,7 +126,7 @@ def generate_header():
     sys_info = get_system_info()
     cost_info = estimate_cost(gpu_info)
 
-    header = f"""# nanochat training report
+    header = f"""# nanoAttnRes training report
 
 Generated: {timestamp}
 

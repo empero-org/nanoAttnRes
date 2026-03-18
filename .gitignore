@@ -10,4 +10,6 @@ eval_bundle/
 
 # Local setup
 CLAUDE.md
+.claude/
 wandb/
+out/

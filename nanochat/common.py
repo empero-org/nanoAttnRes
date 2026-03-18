@@ -1,5 +1,5 @@
 """
-Common utilities for nanochat.
+Common utilities for nanoAttnRes.
 """
 
 import os

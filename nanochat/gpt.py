@@ -10,6 +10,9 @@ Notable features:
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
 - Flash Attention 3 integration
+- Block Attention Residuals (AttnRes): learned cross-block aggregation replaces additive residuals
+  at block boundaries. Ref: https://arxiv.org/abs/2603.15031
+  Enable with attn_res_block_size > 0 (paper recommends 8).
 """
 
 from functools import partial
@@ -37,6 +40,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Block AttnRes: partition layers into blocks of this size and replace additive residuals at
+    # block boundaries with learned attention over all previous block outputs.
+    # 0 = disabled (standard residuals). Paper recommends 8.
+    attn_res_block_size: int = 8
 
 
 def norm(x):
@@ -184,6 +191,11 @@ class GPT(nn.Module):
         self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
+        # Block AttnRes: per-layer learned projection vectors for scoring block checkpoints.
+        # attn_res_proj[i] used before layer i's attention AND MLP sub-layers.
+        # logits = (RMSNorm(V) * attn_res_proj[i]).sum(-1), then softmax over block dim.
+        if config.attn_res_block_size > 0:
+            self.attn_res_proj = nn.Parameter(torch.zeros(config.n_layer, config.n_embd))
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -246,6 +258,10 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # Block AttnRes projections: small normal init so all blocks start with near-uniform weights
+        if self.config.attn_res_block_size > 0:
+            torch.nn.init.normal_(self.attn_res_proj, std=n_embd**-0.5)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -354,7 +370,10 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        scalars = (self.resid_lambdas.numel() + self.x0_lambdas.numel() +
+                   self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+        if self.config.attn_res_block_size > 0:
+            scalars += self.attn_res_proj.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -378,6 +397,8 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+        if self.config.attn_res_block_size > 0:
+            smear_params.append(self.attn_res_proj)
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
@@ -448,12 +469,35 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Block AttnRes (arxiv 2603.15031): before each attention AND MLP sub-layer, enrich the
+        # input with a learned attention-weighted sum over all saved block checkpoints + current state.
+        # Each layer has its own projection vector (attn_res_proj[i]) to score the checkpoints.
+        # Seeded with x0 so even the very first layer can attend back to the initial embedding.
+        # Block checkpoints (raw layer outputs) are saved every attn_res_block_size layers.
+        block_size = self.config.attn_res_block_size
+        attn_res_blocks = [x0] if block_size > 0 else []
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x_in = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if block_size > 0:
+                proj_i = self.attn_res_proj[i]
+                # Before attention: attend over all checkpoints + current intra-block state
+                V = torch.stack(attn_res_blocks + [x_in])              # (N+1, B, T, d)
+                logits = (norm(V) * proj_i).sum(-1)                     # (N+1, B, T)
+                h_attn = (logits.softmax(0).unsqueeze(-1) * V).sum(0)  # (B, T, d)
+                x_mid = x_in + block.attn(norm(h_attn), ve, cos_sin, self.window_sizes[i], kv_cache)
+                # Before MLP: attend again with updated intra-block state
+                V = torch.stack(attn_res_blocks + [x_mid])
+                logits = (norm(V) * proj_i).sum(-1)
+                h_mlp = (logits.softmax(0).unsqueeze(-1) * V).sum(0)
+                x = x_mid + block.mlp(norm(h_mlp))
+            else:
+                x = block(x_in, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
+            # Save raw block output as checkpoint at each block boundary
+            if block_size > 0 and (i + 1) % block_size == 0:
+                attn_res_blocks.append(x)
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
